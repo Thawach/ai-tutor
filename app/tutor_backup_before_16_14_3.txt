@@ -1,0 +1,1037 @@
+from app.ai import (
+    chat_with_ai,
+    reset_ai_usage,
+    get_ai_usage_summary,
+)   
+from app.memory import ConversationMemory
+from app.state import TutorState
+from app.evaluator import evaluate_response
+from app.prompts.builder import PromptBuilder
+from app.services.knowledge_service import KnowledgeService
+from app.services.grounding_guard import GroundingGuard
+
+from app.services.response_grounding_validator import (
+    ResponseGroundingValidator,
+)
+
+from app.services.pedagogical_response_validator import (
+    PedagogicalResponseValidator,
+)
+
+from app.services.pedagogical_validation_models import (
+    PedagogicalValidationResult,
+)
+
+from app.services.pedagogical_precheck import (
+    PedagogicalPrecheck,
+)
+
+from app.services.response_repair_service import (
+    ResponseRepairService,
+)
+
+from app.services.relevance_gate import (
+    RelevanceGate,
+)
+
+from app.services.retrieval_query_builder import (
+    RetrievalQueryBuilder,
+)
+
+from app.domain.scaffolding.policy import (
+    ScaffoldingPolicy,
+)
+
+from app.domain.scaffolding.strategies import (
+    get_strategy,
+)
+
+from app.domain.scaffolding.interventions import (
+    get_intervention,
+)
+
+from app.domain.scaffolding.citation_policy import (
+    CitationPolicy,
+)
+
+
+class AITutor:
+
+    def __init__(self):
+        self.memory = ConversationMemory()
+        self.state = TutorState()
+
+        self.scaffolding_policy = ScaffoldingPolicy()
+        self.prompt_builder = PromptBuilder()
+        self.knowledge_service = KnowledgeService()
+        self.relevance_gate = RelevanceGate()
+        self.grounding_guard = GroundingGuard()
+        self.response_grounding_validator = (
+            ResponseGroundingValidator()
+        )
+
+        self.pedagogical_response_validator = (
+            PedagogicalResponseValidator()
+        )
+
+        self.pedagogical_precheck = (
+            PedagogicalPrecheck()
+        )
+
+        self.response_repair_service = (
+            ResponseRepairService()
+        )
+
+        self.retrieval_query_builder = RetrievalQueryBuilder()
+        self.citation_policy = CitationPolicy()
+
+        self.original_question = None
+        self.waiting_for_response = False
+        self.last_decision = None
+
+        self.last_evaluation_result = None
+        self.last_intervention = None
+
+        self.last_system_prompt = None
+        self.last_knowledge_result = None
+        self.last_relevance_result = None
+        self.last_grounding_status = None
+
+        self.last_grounding_validation = None
+        self.last_pedagogical_precheck = None
+
+        self.last_pedagogical_validation = None
+        
+        self.last_repair_validation = None
+        self.last_repair_pedagogical_precheck = None
+        self.last_repair_pedagogical_validation = None
+        
+        self.last_response_repaired = False
+        
+        self.last_ai_usage_summary = None
+
+        self.last_retrieval_query = None
+        
+    def respond(self, user_message: str) -> str:
+
+        reset_ai_usage()
+        self.state.next_turn()
+
+        # -------------------------
+        # First question
+        # -------------------------
+
+        if not self.waiting_for_response:
+
+            self.original_question = user_message
+            self.waiting_for_response = True
+
+        # -------------------------
+        # Learner response
+        # -------------------------
+
+        else:
+
+            last_tutor_question = (
+                self.memory.get_last_assistant_message()
+            )
+
+            evaluation_result = evaluate_response(
+                original_question=self.original_question,
+                tutor_question=last_tutor_question,
+                learner_response=user_message,
+            )
+
+            self.last_evaluation_result = evaluation_result
+
+            if (
+                evaluation_result.classification == "misconception"
+                and evaluation_result.misconception
+            ):
+                self.state.add_misconception(
+                    evaluation_result.misconception
+                )
+
+            evaluation = evaluation_result.classification
+
+            self.state.set_evaluation(
+                evaluation
+            )
+
+            decision = self.scaffolding_policy.decide(
+                state=self.state,
+                evaluation=evaluation,
+            )
+
+            self.last_decision = decision
+
+        # -------------------------
+        # Build retrieval query
+        # -------------------------
+
+        retrieval_tutor_question = (
+            self.memory.get_last_assistant_message()
+            )
+
+        knowledge_query = (
+            self.retrieval_query_builder.build(
+                original_question=(
+                    self.original_question
+                    or user_message
+                ),
+                tutor_question=retrieval_tutor_question,
+                learner_response=user_message,
+            )
+        )
+
+        # เก็บ query ล่าสุดไว้สำหรับ Debug
+        self.last_retrieval_query = knowledge_query
+
+        # -------------------------
+        # Retrieve course knowledge
+        # -------------------------
+
+        knowledge_result = (
+            self.knowledge_service.retrieve(
+                query=knowledge_query,
+                n_results=5,
+            )
+        )
+
+        self.last_knowledge_result = (
+            knowledge_result
+        )
+
+        # -------------------------
+        # Evaluate retrieval relevance
+        # -------------------------
+
+        relevance_result = (
+            self.relevance_gate.evaluate(
+                query=knowledge_query,
+                knowledge_result=knowledge_result,
+            )
+        )
+
+        self.last_relevance_result = (
+            relevance_result
+        )
+
+        # -------------------------
+        # Evaluate grounding
+        # -------------------------
+
+        grounding_status = (
+            self.grounding_guard.evaluate(
+                result=knowledge_result,
+                relevance=relevance_result,
+            )
+        )
+
+        self.last_grounding_status = (
+            grounding_status
+        )
+
+        # -------------------------
+        # Select scaffolding
+        # -------------------------
+
+        strategy = get_strategy(
+            self.state.scaffolding_level
+        )
+
+        intervention = get_intervention(
+            self.state.last_evaluation
+        )
+
+        intervention_name = getattr(
+            intervention,
+            "name",
+            "none",
+        )
+
+        intervention_instruction = getattr(
+            intervention,
+            "instruction",
+            "",
+        )
+
+        self.last_intervention = intervention
+
+        misconception = None
+
+        if self.last_evaluation_result is not None:
+            misconception = (
+                self.last_evaluation_result.misconception
+            )
+
+        # -------------------------
+        # Build system prompt
+        # -------------------------
+
+        system_prompt = (
+            self.prompt_builder.build_system_prompt(
+                strategy=strategy,
+                intervention=intervention,
+                misconception=misconception,
+                knowledge_context=knowledge_result.context,
+                has_grounded_knowledge=grounding_status.has_knowledge,
+            )
+        )
+
+        self.last_system_prompt = system_prompt
+
+        # -------------------------
+        # Build messages
+        # -------------------------
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            }
+        ]
+
+        messages.extend(
+            self.memory.get_messages()
+        )
+
+        messages.append(
+            {
+                "role": "user",
+                "content": user_message,
+            }
+        )
+
+        # -------------------------
+        # Generate tutor response
+        # -------------------------
+
+        answer = chat_with_ai(
+            messages,
+            task_name="tutor",
+        )
+      
+        # -------------------------
+        # Validate grounded response
+        # -------------------------
+
+        grounding_validation = None
+
+        pedagogical_precheck = None
+        pedagogical_validation = None
+
+        repair_validation = None
+
+        repair_pedagogical_precheck = None
+        repair_pedagogical_validation = None
+
+        self.last_response_repaired = False
+        self.last_repair_validation = None
+
+        self.last_response_repaired = False
+        self.last_repair_validation = None
+
+
+        if grounding_status.has_knowledge:
+
+            grounding_validation = (
+                self.response_grounding_validator.validate(
+                    response=answer,
+                    knowledge_context=knowledge_result.context,
+                )
+            )
+        # -------------------------
+        # Pedagogical precheck
+        # -------------------------
+
+        pedagogical_precheck = (
+            self.pedagogical_precheck.evaluate(
+                response=answer,
+                strategy_name=strategy.name,
+            )
+        )
+
+
+        # -------------------------
+        # Pedagogical validation
+        # -------------------------
+
+        if pedagogical_precheck.status == "valid":
+
+            pedagogical_validation = (
+                PedagogicalValidationResult(
+                    status="valid",
+                    confidence=1.0,
+                    reason=(
+                        "Validated by deterministic "
+                        "pedagogical precheck."
+                    ),
+                    issues=[],
+                )
+            )
+
+        elif pedagogical_precheck.status == "violation":
+
+            pedagogical_validation = (
+                PedagogicalValidationResult(
+                    status="violation",
+                    confidence=1.0,
+                    reason=(
+                        pedagogical_precheck.reason
+                    ),
+                    issues=(
+                        pedagogical_precheck.issues
+                    ),
+                )
+            )
+
+        else:
+            pedagogical_validation = (
+                self.pedagogical_response_validator.validate(
+                    response=answer,
+                    scaffolding_level=(
+                        self.state.scaffolding_level
+                    ),
+                    strategy_name=(
+                        strategy.name
+                    ),
+                    strategy_instruction=(
+                        strategy.instruction
+                    ),
+                    intervention_name=(
+                        intervention_name
+                    ),
+                    intervention_instruction=(
+                        intervention_instruction
+                    ),
+                )
+            )
+
+            # -------------------------
+            # Store original precheck
+            # -------------------------
+
+            self.last_pedagogical_precheck = (
+                pedagogical_precheck
+            )
+
+
+            # -------------------------
+            # Repair decision
+            # -------------------------
+
+        needs_repair = (
+            grounding_validation.status
+            in {
+                "partially_supported",
+                "unsupported",
+            }
+            or
+            (
+                pedagogical_validation is not None
+                and
+                pedagogical_validation.status == "violation"
+            )
+        )
+
+
+
+            # -------------------------
+            # Repair unsupported response
+            # -------------------------
+
+            needs_repair = (
+                grounding_validation.status
+                in {
+                    "partially_supported",
+                    "unsupported",
+                }
+                or
+                (
+                    pedagogical_validation is not None
+                    and
+                    pedagogical_validation.status
+                    == "violation"
+                )
+            )
+
+            if needs_repair:
+                pedagogical_issues = []
+
+                if pedagogical_validation is not None:
+                    pedagogical_issues = (
+                        pedagogical_validation.issues
+                    )
+                repaired_answer = (
+                    self.response_repair_service.repair(
+                        original_response=answer,
+                        knowledge_context=(
+                            knowledge_result.context
+                        ),
+
+                        pedagogical_issues=(
+                            pedagogical_issues
+                        ),
+
+                        validation=grounding_validation,
+                        learner_message=user_message,
+                        scaffolding_level=(
+                            self.state.scaffolding_level
+                        ),
+                        strategy_name=(
+                            strategy.name
+                        ),
+                        strategy_instruction=(
+                            strategy.instruction
+                        ),
+                        intervention_name=(
+                            intervention_name
+                        ),
+                    )
+                )
+
+
+                # -------------------------
+                # Validate repaired response
+                # -------------------------
+
+                repair_validation = (
+                    self.response_grounding_validator.validate(
+                        response=repaired_answer,
+                        knowledge_context=(
+                            knowledge_result.context
+                        ),
+                        task_name=(
+                            "response_validator_repair"
+                        ),
+                    )
+                )
+
+                repair_pedagogical_validation = (
+                    self.pedagogical_response_validator.validate(
+                        response=repaired_answer,
+                        scaffolding_level=self.state.scaffolding_level,
+                        strategy_name=strategy.name,
+                        strategy_instruction=strategy.instruction,
+                        intervention_name=intervention_name,
+                        intervention_instruction=intervention_instruction,
+                        task_name="pedagogical_validator_repair",
+                    )
+                )
+
+                if (
+                    repair_validation.status == "supported"
+                    and
+                    repair_pedagogical_validation is not None
+                    and
+                    repair_pedagogical_validation.status == "valid"
+                ):
+
+                    answer = repaired_answer
+
+                    self.last_response_repaired = True
+                
+                else:
+                    if repair_validation.status != "supported":
+
+                        answer = self._build_grounding_fallback(
+                            learner_message=user_message,
+                        )
+
+                    else:
+
+                        answer = self._build_pedagogical_fallback(
+                            learner_message=user_message,
+                            strategy_name=strategy.name,
+                        )
+
+        self.last_grounding_validation = (
+            grounding_validation
+        )
+
+        self.last_pedagogical_validation = (
+            pedagogical_validation
+        )
+
+        self.last_repair_validation = (
+            repair_validation
+        )
+
+        self.last_repair_pedagogical_validation = (
+            repair_pedagogical_validation
+        )
+
+                # -------------------------
+                # Collect AI usage
+                # -------------------------
+
+        self.last_ai_usage_summary = (
+            get_ai_usage_summary()
+        )
+
+        # -------------------------
+        # Save conversation
+        # -------------------------
+
+        self.memory.add_user_message(
+            user_message
+        )
+
+        self.memory.add_assistant_message(
+            answer
+        )
+
+        return answer
+
+    def _build_grounding_fallback(
+        self,
+        learner_message: str,
+    ) -> str:
+        """
+        Fail-safe response เมื่อทั้ง original response
+        และ repaired response ยังไม่ผ่าน grounding validation.
+        """
+
+        has_thai = any(
+            "\u0E00" <= char <= "\u0E7F"
+            for char in learner_message
+        )
+
+        if has_thai:
+            return (
+                "ข้อมูลจากเอกสารรายวิชาที่มีอยู่ยังไม่เพียงพอ"
+                "ให้ฉันอธิบายประเด็นนี้ได้อย่างมั่นใจ "
+                "ลองระบุส่วนของเนื้อหาที่ต้องการศึกษาให้เจาะจงขึ้น"
+                "อีกเล็กน้อยได้ไหม?"
+            )
+
+        return (
+            "The available course material does not provide "
+            "enough verified information for me to explain "
+            "this point confidently. Could you make the "
+            "learning point a little more specific?"
+        )
+
+    def _build_pedagogical_fallback(
+        self,
+        learner_message: str,
+        strategy_name: str,
+    ) -> str:
+        """
+        Deterministic fallback เมื่อ factual grounding ผ่าน
+        แต่คำตอบไม่ผ่าน pedagogical validation.
+        """
+
+        has_thai = any(
+            "\u0E00" <= char <= "\u0E7F"
+            for char in learner_message
+        )
+
+        if has_thai:
+
+            if strategy_name == "guiding_question":
+                return (
+                    "จากสิ่งที่คุณรู้อยู่แล้ว "
+                    "คุณคิดว่าประเด็นสำคัญที่สุดที่ควรพิจารณา"
+                    "เพื่อหาคำตอบคืออะไร?"
+                )
+
+            if strategy_name == "hint":
+                return (
+                    "ลองพิจารณาข้อมูลสำคัญเพียงจุดเดียวก่อน "
+                    "คุณคิดว่าข้อมูลนั้นช่วยให้เข้าใกล้คำตอบอย่างไร?"
+                )
+
+            return (
+                "ลองทบทวนแนวคิดสำคัญจากข้อมูลที่มีอยู่ "
+                "แล้วอธิบายความเข้าใจของคุณอีกครั้งได้ไหม?"
+            )
+
+        if strategy_name == "guiding_question":
+            return (
+                "Based on what you already know, what is the "
+                "single most important point to consider here?"
+            )
+
+        if strategy_name == "hint":
+            return (
+                "Focus on one relevant clue first. "
+                "How might that clue help you move toward the answer?"
+            )
+
+        return (
+        "Review the key concept from the available information. "
+        "How would you explain your understanding now?"
+    )
+
+    def _build_grounding_fallback(
+        self,
+        learner_message: str,
+    ) -> str:
+        """
+        Fail-safe response เมื่อทั้ง original response
+        และ repaired response ยังไม่ผ่าน grounding validation.
+        """
+
+        has_thai = any(
+            "\u0E00" <= char <= "\u0E7F"
+            for char in learner_message
+        )
+
+        if has_thai:
+            return (
+                "ข้อมูลจากเอกสารรายวิชาที่มีอยู่ยังไม่เพียงพอ"
+                "ให้ฉันอธิบายประเด็นนี้ได้อย่างมั่นใจ "
+                "ลองระบุส่วนของเนื้อหาที่ต้องการศึกษาให้เจาะจงขึ้น"
+                "อีกเล็กน้อยได้ไหม?"
+            )
+
+        return (
+            "The available course material does not provide "
+            "enough verified information for me to explain "
+            "this point confidently. Could you make the "
+            "learning point a little more specific?"
+        )
+
+    def reset(self):
+
+        self.memory.clear()
+        self.state.reset()
+
+        reset_ai_usage()
+
+        self.original_question = None
+        self.waiting_for_response = False
+        self.last_decision = None
+
+        self.last_evaluation_result = None
+        self.last_intervention = None
+
+        self.last_system_prompt = None
+        self.last_knowledge_result = None
+        self.last_relevance_result = None
+        self.last_grounding_status = None
+        self.last_grounding_validation = None
+
+        self.last_response_repaired = False
+        self.last_repair_validation = None
+
+        self.last_repair_pedagogical_validation = None
+
+        self.last_ai_usage_summary = None
+
+        self.last_retrieval_query = None
+        
+
+    def get_last_system_prompt(self):
+        return self.last_system_prompt
+
+    def get_level(self):
+        return self.state.scaffolding_level
+
+    def get_evaluation(self):
+        return self.state.last_evaluation
+
+    def get_debug_info(self) -> dict:
+
+        knowledge_citations = []
+
+        if self.last_knowledge_result is not None:
+            knowledge_citations = [
+                {
+                    "source": item.source,
+                    "page": item.page,
+                }
+                for item in self.last_knowledge_result.citations
+            ]
+
+        strategy = get_strategy(
+            self.state.scaffolding_level
+        )
+
+        decision_reason = None
+        decision_action = None
+
+        if self.last_decision is not None:
+            decision_reason = self.last_decision.reason
+            decision_action = self.last_decision.action
+
+        evaluation_confidence = None
+        evaluation_reason = None
+        evaluation_misconception = None
+
+        if self.last_evaluation_result is not None:
+            evaluation_confidence = (
+                self.last_evaluation_result.confidence
+            )
+
+            evaluation_reason = (
+                self.last_evaluation_result.reason
+            )
+
+            evaluation_misconception = (
+                self.last_evaluation_result.misconception
+            )
+
+        active_misconceptions = (
+            self.state.get_active_misconceptions()
+        )
+
+        intervention_name = None
+
+        if self.last_intervention is not None:
+            intervention_name = (
+                self.last_intervention.name
+            )
+
+        knowledge_sources = []
+
+        if self.last_knowledge_result is not None:
+            knowledge_sources = [
+                {
+                    "source": item.source,
+                    "page": item.page,
+                    "distance": item.distance,
+                }
+                for item in self.last_knowledge_result.sources
+            ]
+
+            show_citations = self.citation_policy.should_show(
+                scaffolding_level=self.state.scaffolding_level,
+                intervention=intervention_name,
+                )
+
+
+        grounding_has_knowledge = None
+        grounding_reason = None
+
+        if self.last_grounding_status is not None:
+            grounding_has_knowledge = (
+                self.last_grounding_status.has_knowledge
+            )
+            grounding_reason = (
+                self.last_grounding_status.reason
+            )
+
+            relevance_is_relevant = None
+            relevance_confidence = None
+            relevance_reason = None
+
+        if self.last_relevance_result is not None:
+            relevance_is_relevant = (
+                self.last_relevance_result.is_relevant
+            )
+
+            relevance_confidence = (
+                self.last_relevance_result.confidence
+            )
+
+            relevance_reason = (
+                self.last_relevance_result.reason
+            )
+
+
+        validation_status = None
+        validation_confidence = None
+        validation_reason = None
+        validation_issues = []
+
+        if self.last_grounding_validation is not None:
+
+            validation_status = (
+                self.last_grounding_validation.status
+            )
+
+            validation_confidence = (
+                self.last_grounding_validation.confidence
+            )
+
+            validation_reason = (
+                self.last_grounding_validation.reason
+            )
+
+            validation_issues = (
+                self.last_grounding_validation.issues
+            )
+
+        ai_usage = (
+            self.last_ai_usage_summary
+            if self.last_ai_usage_summary is not None
+            else {
+                "calls": 0,
+                "total_latency_ms": 0.0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "records": [],
+            }
+        )
+
+        pedagogical_status = None
+        pedagogical_confidence = None
+        pedagogical_reason = None
+        pedagogical_issues = []
+
+        if self.last_pedagogical_validation is not None:
+
+            pedagogical_status = (
+                self.last_pedagogical_validation.status
+            )
+
+            pedagogical_confidence = (
+                self.last_pedagogical_validation.confidence
+            )
+
+            pedagogical_reason = (
+                self.last_pedagogical_validation.reason
+            )
+
+            pedagogical_issues = (
+                self.last_pedagogical_validation.issues
+            )
+
+        repair_status = None
+        repair_confidence = None
+        repair_reason = None
+        repair_issues = []
+
+        repair_pedagogical_status = None
+        repair_pedagogical_confidence = None
+        repair_pedagogical_reason = None
+        repair_pedagogical_issues = []
+
+        if (
+            self.last_repair_pedagogical_validation
+            is not None
+        ):
+
+            repair_pedagogical_status = (
+                self.last_repair_pedagogical_validation.status
+            )
+
+            repair_pedagogical_confidence = (
+                self.last_repair_pedagogical_validation.confidence
+            )
+
+            repair_pedagogical_reason = (
+                self.last_repair_pedagogical_validation.reason
+            )
+
+            repair_pedagogical_issues = (
+                self.last_repair_pedagogical_validation.issues
+            )
+
+        if self.last_repair_validation is not None:
+
+            repair_status = (
+                self.last_repair_validation.status
+            )
+
+            repair_confidence = (
+                self.last_repair_validation.confidence
+            )
+
+            repair_reason = (
+                self.last_repair_validation.reason
+            )
+
+            repair_issues = (
+                self.last_repair_validation.issues
+            )
+
+        return {
+            "level": self.state.scaffolding_level,
+            "strategy": strategy.name,
+
+            "intervention": intervention_name,
+
+            "evaluation": self.state.last_evaluation,
+
+            "evaluation_confidence": evaluation_confidence,
+            "evaluation_reason": evaluation_reason,
+            "evaluation_misconception": evaluation_misconception,
+
+            "decision_action": decision_action,
+            "decision_reason": decision_reason,
+
+            "correct_streak": self.state.correct_streak,
+            "partial_streak": self.state.partial_streak,
+            "failure_streak": self.state.failure_streak,
+
+            "turn": self.state.turn_count,
+            "attempt": self.state.attempt_count,
+            "knowledge_citations": knowledge_citations,
+            "show_citations": show_citations,
+
+            "relevance_is_relevant": relevance_is_relevant,
+            "relevance_confidence": relevance_confidence,
+            "relevance_reason": relevance_reason,
+
+            "grounding_has_knowledge": grounding_has_knowledge,
+            "grounding_reason": grounding_reason,     
+
+            "validation_status": validation_status,
+            "validation_confidence": validation_confidence,
+            "validation_reason": validation_reason,
+            "validation_issues": validation_issues,     
+
+            "pedagogical_status": pedagogical_status,
+            "pedagogical_confidence": pedagogical_confidence,
+            "pedagogical_reason": pedagogical_reason,
+            "pedagogical_issues": pedagogical_issues,
+
+            "response_repaired": (
+                self.last_response_repaired
+            ),
+
+            "repair_pedagogical_status": (
+                repair_pedagogical_status
+            ),
+
+            "repair_pedagogical_confidence": (
+                repair_pedagogical_confidence
+            ),
+
+            "repair_pedagogical_reason": (
+                repair_pedagogical_reason
+            ),
+
+            "repair_pedagogical_issues": (
+                repair_pedagogical_issues
+            ),
+
+            "repair_strategy": (
+                strategy.name
+                if self.last_response_repaired
+                else None
+            ),
+
+            "repair_scaffolding_level": (
+                self.state.scaffolding_level
+                if self.last_response_repaired
+                else None
+            ),
+
+            "repair_status": repair_status,
+            "repair_confidence": repair_confidence,
+            "repair_reason": repair_reason,
+            "repair_issues": repair_issues,
+
+            "ai_usage": ai_usage,
+
+            "active_misconceptions": [
+                {
+                    "description": item.description,
+                    "occurrence_count": item.occurrence_count,
+                    "status": item.status,
+                }
+                for item in active_misconceptions
+            ],
+
+            "knowledge_sources": knowledge_sources,
+            "retrieval_query": (
+                self.last_retrieval_query
+            ),
+        }

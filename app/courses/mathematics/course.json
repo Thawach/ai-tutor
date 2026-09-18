@@ -1,0 +1,35 @@
+{
+    "course_id": "mathematics",
+    "course_name": "Basic Mathematics",
+    "language": "th",
+    "description": "รายวิชาคณิตศาสตร์พื้นฐาน",
+
+    "document_path": "./docs/mathematics",
+    "chroma_path": "./data/chroma/mathematics",
+
+    "technical_terms": {},
+
+    "embedded_claim_patterns": [],
+
+    "response_style": {
+    "primary_language": "th",
+    "allow_technical_english": true,
+    "technical_term_format": "thai_with_english_parentheses",
+    "tone": "supportive_academic",
+    "explanation_depth": "adaptive",
+    "question_style": "socratic",
+    "max_guiding_questions": 1
+    },
+
+    "response_quality": {
+    "max_characters": 1200,
+    "min_characters": 3,
+    "max_questions": 2,
+    "detect_repetition": true
+    },
+    
+    "metadata": {
+        "domain": "mathematics",
+        "version": "1.0"
+    }
+}

@@ -1,0 +1,46 @@
+{
+  "course_id": "electronics",
+  "course_name": "Basic Electronics",
+  "language": "th",
+  "description": "รายวิชาอิเล็กทรอนิกส์เบื้องต้น",
+
+  "document_path": "./docs/electronics",
+  "chroma_path": "./data/chroma/electronics",
+
+  "technical_terms": {
+    "อิเล็กเตอร์": "อิมิตเตอร์ (Emitter)",
+    "อิเลคเตอร์": "อิมิตเตอร์ (Emitter)"
+  },
+
+  "embedded_claim_patterns": [
+    "ที่เป็น\\s+(?:n[-\\s]?type|p[-\\s]?type)",
+    "ซึ่งเป็น\\s+(?:n[-\\s]?type|p[-\\s]?type)",
+    "มีโครงสร้าง\\s+(?:N\\s*[-–—]\\s*P\\s*[-–—]\\s*N|P\\s*[-–—]\\s*N\\s*[-–—]\\s*P)",
+    "คือ\\s+(?:N\\s*[-–—]\\s*P\\s*[-–—]\\s*N|P\\s*[-–—]\\s*N\\s*[-–—]\\s*P)",
+    "\\bis\\b.*\\b(?:n[-\\s]?type|p[-\\s]?type)\\b",
+    "\\bhas\\b.*\\b(?:N\\s*[-–—]\\s*P\\s*[-–—]\\s*N|P\\s*[-–—]\\s*N\\s*[-–—]\\s*P)\\b.*\\bstructure\\b"
+
+  ],
+
+  "response_style": {
+    "primary_language": "th",
+    "allow_technical_english": true,
+    "technical_term_format": "thai_with_english_parentheses",
+    "tone": "supportive_academic",
+    "explanation_depth": "adaptive",
+    "question_style": "socratic",
+    "max_guiding_questions": 1
+  },
+
+  "response_quality": {
+    "max_characters": 1200,
+    "min_characters": 3,
+    "max_questions": 2,
+    "detect_repetition": true
+  },
+
+  "metadata": {
+    "domain": "electronics",
+    "version": "1.0"
+  }
+}
